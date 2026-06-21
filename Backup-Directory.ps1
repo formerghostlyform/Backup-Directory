@@ -6,7 +6,7 @@
     Creates a timestamped zip archive of the source directory in the destination
     directory, then applies a tiered retention policy:
       - Past 90 days  : keep all backups
-      - Past 9 months : keep the last backup of each calendar month
+      - Past 12 months: keep the last backup of each calendar month
       - Past 5 years  : keep the last backup of each calendar year
       - Older         : delete
 
@@ -44,8 +44,8 @@
     Retention policy applied during cleanup:
 
       0 – 90 days       Keep ALL backups
-      90 days – ~1 yr   Keep the last backup of each calendar month
-      ~1 yr – 5 years   Keep the last backup of each calendar year
+            90 days – ~15 mo  Keep the last backup of each calendar month
+            ~15 mo – 5 years  Keep the last backup of each calendar year
       > 5 years         Delete
 
     Only zip files matching the pattern <SourceDirName>_yyyyMMdd_HHmmss.zip are
@@ -550,7 +550,7 @@ $WhatIfPreference = $originalWhatIfPreference
 # ---------------------------------------------------------------------------
 $now           = Get-Date
 $cutoffRecent  = $now.AddDays(-90)          # keep ALL backups newer than this
-$cutoffMonthly = $cutoffRecent.AddMonths(-9) # keep one-per-MONTH between here and cutoffRecent
+$cutoffMonthly = $cutoffRecent.AddMonths(-12) # keep one-per-MONTH between here and cutoffRecent
 $cutoffYearly  = $now.AddYears(-5)           # keep one-per-YEAR between here and cutoffMonthly
                                               # delete anything older than cutoffYearly
 
@@ -591,7 +591,7 @@ $allBackups |
     Where-Object { $_.Date -ge $cutoffRecent } |
     ForEach-Object { $keepPaths.Add($_.File.FullName) | Out-Null }
 
-# Tier 2 – 90 days to 9 months before the 90-day mark: keep last per calendar month
+# Tier 2 – 90 days to 12 months before the 90-day mark: keep last per calendar month
 $allBackups |
     Where-Object { $_.Date -ge $cutoffMonthly -and $_.Date -lt $cutoffRecent } |
     Group-Object { $_.Date.ToString('yyyy-MM') } |
@@ -600,7 +600,7 @@ $allBackups |
         $keepPaths.Add($last.File.FullName) | Out-Null
     }
 
-# Tier 3 – beyond 9+3 months back to 5 years: keep last per calendar year
+# Tier 3 – beyond 12+3 months back to 5 years: keep last per calendar year
 $allBackups |
     Where-Object { $_.Date -ge $cutoffYearly -and $_.Date -lt $cutoffMonthly } |
     Group-Object { $_.Date.Year } |

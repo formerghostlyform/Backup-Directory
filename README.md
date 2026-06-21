@@ -53,7 +53,7 @@ Unregister-ScheduledTask -TaskName "Backup MyApp Directory" -Confirm:$false
 During cleanup, the script keeps:
 
 - Last 90 days: all backups
-- Past 9 months: last backup of each calendar month
+- Past 12 months: last backup of each calendar month
 - Past 5 years: last backup of each calendar year
 - Older than 5 years: deleted
 
