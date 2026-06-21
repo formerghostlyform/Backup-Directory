@@ -137,6 +137,7 @@ $runLockAcquired = $false
 $runSucceeded = $false
 $notificationTitle = 'Backup Failed'
 $notificationMessage = 'Backup did not complete.'
+$originalWhatIfPreference = $WhatIfPreference
 
 try {
 
@@ -203,7 +204,7 @@ $dateCode      = Get-Date -Format 'yyyyMMdd_HHmmss'
 
 if (-not (Test-Path -LiteralPath $DestinationPath)) {
     Write-Host "Destination directory does not exist; creating: $DestinationPath"
-    New-Item -ItemType Directory -Path $DestinationPath -Force | Out-Null
+    New-Item -ItemType Directory -Path $DestinationPath -Force -WhatIf:$false | Out-Null
 }
 $DestinationPath = (Resolve-Path -Path $DestinationPath).Path
 
@@ -247,19 +248,24 @@ Write-Host 'Execution lock acquired for this backup job.'
 
 if (-not (Test-Path -LiteralPath $LogDirectory)) {
     Write-Host "Log directory does not exist; creating: $LogDirectory"
-    New-Item -ItemType Directory -Path $LogDirectory -Force | Out-Null
+    New-Item -ItemType Directory -Path $LogDirectory -Force -WhatIf:$false | Out-Null
 }
 $LogDirectory = (Resolve-Path -Path $LogDirectory).Path
 
 $logFileName = "${sourceDirName}_${dateCode}.log"
 $logFilePath = Join-Path $LogDirectory $logFileName
-try {
-    Start-Transcript -Path $logFilePath -Force | Out-Null
-    $transcriptStarted = $true
-    Write-Host "Logging to '$logFilePath'"
+if (-not $WhatIfPreference) {
+    try {
+        Start-Transcript -Path $logFilePath -Force | Out-Null
+        $transcriptStarted = $true
+        Write-Host "Logging to '$logFilePath'"
+    }
+    catch {
+        Write-Warning "Unable to start transcript logging at '$logFilePath': $($_.Exception.Message)"
+    }
 }
-catch {
-    Write-Warning "Unable to start transcript logging at '$logFilePath': $($_.Exception.Message)"
+else {
+    Write-Host "WhatIf: transcript logging skipped."
 }
 
 # ---------------------------------------------------------------------------
@@ -305,6 +311,8 @@ Write-Host 'Indexing source files ...'
 $sourceFiles = @(Get-ChildItem -LiteralPath $compressSource -Recurse -File | Sort-Object -Property FullName)
 $sourceSize = ($sourceFiles | Measure-Object -Property Length -Sum).Sum
 if ($null -eq $sourceSize) { $sourceSize = 0 }
+$largestSourceFile = ($sourceFiles | Measure-Object -Property Length -Maximum).Maximum
+if ($null -eq $largestSourceFile) { $largestSourceFile = 0 }
 
 Write-Host 'Checking available disk space ...'
 $destDrive = Split-Path -Qualifier $DestinationPath
@@ -332,9 +340,13 @@ if ($null -ne $freeSpace) {
 # ---------------------------------------------------------------------------
 # Create backup (atomic: write to .tmp, rename to final name after validation)
 # ---------------------------------------------------------------------------
+# Keep WhatIf scoped to cleanup/delete operations; backup creation should still run.
+$WhatIfPreference = $false
+
 $zipFileName   = "${sourceDirName}_${dateCode}.zip"
 $zipFilePath   = Join-Path $DestinationPath $zipFileName
-$tempZipPath   = $zipFilePath + '.tmp'
+# Compress-Archive on Windows PowerShell 5.1 requires a .zip extension.
+$tempZipPath   = Join-Path $DestinationPath ("${sourceDirName}_${dateCode}.tmp.zip")
 $manifestFileName = "${sourceDirName}_${dateCode}.manifest.sha256"
 $manifestFilePath = Join-Path $DestinationPath $manifestFileName
 $tempManifestPath = $manifestFilePath + '.tmp'
@@ -342,12 +354,51 @@ $tempManifestPath = $manifestFilePath + '.tmp'
 Write-Host "Backing up '$SourcePath' -> '$zipFilePath' ..."
 
 $backupJob = $null
+$oversizeThresholdBytes = [int64]2GB
+$useDotNetZip = ($largestSourceFile -ge $oversizeThresholdBytes)
+if ($useDotNetZip) {
+    Write-Host ("Large source file detected ({0:N0} bytes). " -f $largestSourceFile) +
+        'Using Zip64-capable .NET compression engine.'
+}
+
 try {
     # Run compression in a background job so we can show progress on the foreground thread.
     $backupJob = Start-Job -ScriptBlock {
-        param($src, $dest)
-        Compress-Archive -Path $src -DestinationPath $dest -CompressionLevel Optimal
-    } -ArgumentList $compressSource, $tempZipPath
+        param($src, $dest, $preferDotNet)
+
+        function Invoke-DotNetZip {
+            param(
+                [string]$InSource,
+                [string]$InDest
+            )
+
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::CreateFromDirectory(
+                $InSource,
+                $InDest,
+                [System.IO.Compression.CompressionLevel]::Optimal,
+                $true
+            )
+        }
+
+        if ($preferDotNet) {
+            Invoke-DotNetZip -InSource $src -InDest $dest
+            return
+        }
+
+        try {
+            Compress-Archive -Path $src -DestinationPath $dest -CompressionLevel Optimal
+        }
+        catch {
+            $message = $_.Exception.Message
+            if ($message -match 'Stream was too long') {
+                Invoke-DotNetZip -InSource $src -InDest $dest
+            }
+            else {
+                throw
+            }
+        }
+    } -ArgumentList $compressSource, $tempZipPath, $useDotNetZip
 
 $spinnerFrames = @('|', '/', '-', '\')
 $frame         = 0
@@ -430,7 +481,7 @@ finally {
 }
 
 # Atomic rename: only promote to final name after successful validation
-Move-Item -LiteralPath $tempZipPath -Destination $zipFilePath
+Move-Item -LiteralPath $tempZipPath -Destination $zipFilePath -WhatIf:$false
 Write-Host ("Backup complete: $zipFileName  ({0} file(s), {1:N0} bytes)" -f $entryCount, $zipSize)
 
 # Create checksum manifest alongside the zip file
@@ -453,27 +504,27 @@ $sourceFiles |
         $manifestLines.Add("$fileHash  $($_.Length)  $($relativePath.Replace('\', '/'))")
     }
 
-Set-Content -LiteralPath $tempManifestPath -Value $manifestLines -Encoding utf8
-Move-Item -LiteralPath $tempManifestPath -Destination $manifestFilePath -Force
+Set-Content -LiteralPath $tempManifestPath -Value $manifestLines -Encoding utf8 -WhatIf:$false
+Move-Item -LiteralPath $tempManifestPath -Destination $manifestFilePath -Force -WhatIf:$false
 Write-Host "Manifest complete: $manifestFileName"
 }
 catch {
     # Remove the partial temp file so it cannot be mistaken for a valid backup
     if (Test-Path -LiteralPath $tempZipPath) {
         Write-Warning "Removing incomplete temporary file: $(Split-Path $tempZipPath -Leaf)"
-        Remove-Item -LiteralPath $tempZipPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempZipPath -Force -ErrorAction SilentlyContinue -WhatIf:$false
     }
     if (Test-Path -LiteralPath $tempManifestPath) {
         Write-Warning "Removing incomplete temporary manifest: $(Split-Path $tempManifestPath -Leaf)"
-        Remove-Item -LiteralPath $tempManifestPath -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $tempManifestPath -Force -ErrorAction SilentlyContinue -WhatIf:$false
     }
     throw
 }
 finally {
     if ($null -ne $backupJob) {
         try {
-            Stop-Job -Job $backupJob -ErrorAction SilentlyContinue
-            Remove-Job -Job $backupJob -Force -ErrorAction SilentlyContinue
+            Stop-Job -Job $backupJob -ErrorAction SilentlyContinue -WhatIf:$false
+            Remove-Job -Job $backupJob -Force -ErrorAction SilentlyContinue -WhatIf:$false
         }
         catch {
             Write-Warning "Failed to clean up background backup job: $_"
@@ -491,6 +542,8 @@ finally {
         }
     }
 }
+
+$WhatIfPreference = $originalWhatIfPreference
 
 # ---------------------------------------------------------------------------
 # Retention policy helpers
