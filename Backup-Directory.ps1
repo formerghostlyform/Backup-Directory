@@ -128,6 +128,104 @@ function Send-BackupNotification {
     }
 }
 
+function Get-VssCreateReturnMessage {
+    param(
+        [Parameter(Mandatory = $true)]
+        [int]$Code
+    )
+
+    switch ($Code) {
+        0 { 'Success' }
+        1 { 'Access denied' }
+        2 { 'Invalid argument' }
+        3 { 'Specified volume not found' }
+        4 { 'Specified volume not supported' }
+        5 { 'Unsupported shadow copy context' }
+        6 { 'Insufficient storage' }
+        7 { 'Volume is in use' }
+        8 { 'Maximum number of shadow copies reached' }
+        9 { 'Another shadow copy operation is already in progress' }
+        10 { 'Shadow copy provider vetoed the operation' }
+        11 { 'Shadow copy provider is not registered' }
+        12 { 'Provider failure (unknown error)' }
+        default { 'Unknown error code' }
+    }
+}
+
+function Try-ParseBackupTimestampFromName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$FileName,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Pattern,
+
+        [Parameter(Mandatory = $true)]
+        [string]$Kind
+    )
+
+    $m = [regex]::Match($FileName, $Pattern)
+    if (-not $m.Success) {
+        return $null
+    }
+
+    $stamp = '{0}{1}{2}_{3}{4}{5}' -f
+        $m.Groups[1].Value,
+        $m.Groups[2].Value,
+        $m.Groups[3].Value,
+        $m.Groups[4].Value,
+        $m.Groups[5].Value,
+        $m.Groups[6].Value
+
+    $parsed = [datetime]::MinValue
+    $ok = [datetime]::TryParseExact(
+        $stamp,
+        'yyyyMMdd_HHmmss',
+        [System.Globalization.CultureInfo]::InvariantCulture,
+        [System.Globalization.DateTimeStyles]::None,
+        [ref]$parsed
+    )
+
+    if (-not $ok) {
+        Write-Warning "Skipping $Kind file with invalid timestamp format: '$FileName'"
+        return $null
+    }
+
+    return $parsed
+}
+
+function Remove-StaleStagingDirectories {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Prefix,
+
+        [Parameter(Mandatory = $true)]
+        [datetime]$OlderThan
+    )
+
+    $tempRoot = [System.IO.Path]::GetTempPath()
+    $removed = 0
+    $failed = 0
+
+    $candidates = Get-ChildItem -LiteralPath $tempRoot -Directory -Filter ($Prefix + '*') -ErrorAction SilentlyContinue |
+        Where-Object { $_.LastWriteTime -lt $OlderThan }
+
+    foreach ($dir in $candidates) {
+        try {
+            Remove-Item -LiteralPath $dir.FullName -Recurse -Force -ErrorAction Stop -WhatIf:$false
+            $removed++
+        }
+        catch {
+            $failed++
+            Write-Warning "Failed to remove stale staging directory '$($dir.FullName)': $($_.Exception.Message)"
+        }
+    }
+
+    if ($removed -gt 0 -or $failed -gt 0) {
+        Write-Host ("Stale staging cleanup: removed {0}, failed {1}." -f $removed, $failed)
+    }
+}
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $transcriptStarted = $false
@@ -138,6 +236,11 @@ $runSucceeded = $false
 $notificationTitle = 'Backup Failed'
 $notificationMessage = 'Backup did not complete.'
 $originalWhatIfPreference = $WhatIfPreference
+$stagingPrefix = 'BackupDirectory_'
+$staleStagingRetentionDays = 2
+$stagingRoot = $null
+$stagingSource = $null
+$stagingReady = $false
 
 try {
 
@@ -246,6 +349,9 @@ if (-not $runLockAcquired) {
 
 Write-Host 'Execution lock acquired for this backup job.'
 
+$staleCutoff = (Get-Date).AddDays(-$staleStagingRetentionDays)
+Remove-StaleStagingDirectories -Prefix $stagingPrefix -OlderThan $staleCutoff
+
 if (-not (Test-Path -LiteralPath $LogDirectory)) {
     Write-Host "Log directory does not exist; creating: $LogDirectory"
     New-Item -ItemType Directory -Path $LogDirectory -Force -WhatIf:$false | Out-Null
@@ -272,6 +378,7 @@ else {
 # VSS shadow copy (requires elevation; falls back gracefully if unavailable)
 # ---------------------------------------------------------------------------
 $shadowObj      = $null
+$shadowIdForCleanup = $null
 $compressSource = $SourcePath
 
 $currentIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -282,27 +389,110 @@ if ($isAdmin) {
     try {
         Write-Host 'Creating VSS shadow copy ...'
         $sourceVolume = (Split-Path -Qualifier $SourcePath) + '\'
-        $shadowResult = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create `
-            -Arguments @{ Volume = $sourceVolume; Context = 'ClientAccessible' }
+        $contextAttempts = @('ClientAccessibleWriters', 'ClientAccessible', $null)
+        $shadowCreated = $false
 
-        if ($shadowResult.ReturnValue -eq 0) {
-            $shadowObj = Get-CimInstance -ClassName Win32_ShadowCopy `
-                -Filter "ID='$($shadowResult.ShadowID)'"
-            $relPath        = (Split-Path -NoQualifier $SourcePath).TrimStart([char]92)
-            $compressSource = Join-Path ($shadowObj.DeviceName + '\') $relPath
-            Write-Host "Shadow copy created: $($shadowObj.DeviceName)"
-        } else {
-            Write-Warning "VSS creation returned code $($shadowResult.ReturnValue); compressing live files."
+        foreach ($context in $contextAttempts) {
+            $createArgs = @{ Volume = $sourceVolume }
+            if ($null -ne $context) {
+                $createArgs.Context = $context
+            }
+
+            $shadowResult = Invoke-CimMethod -ClassName Win32_ShadowCopy -MethodName Create -Arguments $createArgs
+            $returnCode = [int]$shadowResult.ReturnValue
+
+            if ($returnCode -ne 0) {
+                $contextLabel = if ($null -ne $context) { $context } else { 'Default' }
+                Write-Warning ("VSS create failed for context '{0}' with code {1} ({2})." -f
+                    $contextLabel, $returnCode, (Get-VssCreateReturnMessage -Code $returnCode))
+                continue
+            }
+
+            $shadowId = if ($shadowResult.PSObject.Properties['ShadowID']) {
+                [string]$shadowResult.ShadowID
+            }
+            elseif ($shadowResult.PSObject.Properties['ShadowId']) {
+                [string]$shadowResult.ShadowId
+            }
+            else {
+                $null
+            }
+
+            if (-not $shadowId) {
+                Write-Warning 'VSS reported success but did not return a ShadowID. Compressing live files.'
+                break
+            }
+
+            $shadowIdForCleanup = $shadowId
+
+            $shadowObj = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object { $_.ID -eq $shadowId } | Select-Object -First 1
+            if ($null -eq $shadowObj -or -not $shadowObj.DeviceObject) {
+                Write-Warning "VSS created shadow copy '$shadowId' but it could not be resolved for use. Compressing live files."
+                if ($null -ne $shadowObj) {
+                    try { $shadowObj | Remove-CimInstance } catch {}
+                }
+                $shadowObj = $null
+                break
+            }
+
+            $relPath = (Split-Path -NoQualifier $SourcePath).TrimStart([char]92)
+            $compressSource = Join-Path ($shadowObj.DeviceObject + '\') $relPath
+            Write-Host "Shadow copy created: $($shadowObj.ID)"
+            Write-Host "Using shadow path: $compressSource"
+            $shadowCreated = $true
+            break
+        }
+
+        if (-not $shadowCreated) {
+            Write-Warning 'Unable to create a usable VSS snapshot; compressing live files.'
         }
     }
     catch {
-        Write-Warning "VSS shadow copy failed: $_  Compressing live files."
+        Write-Warning "VSS shadow copy failed: $($_.Exception.Message)  Compressing live files."
         $shadowObj = $null
     }
 } else {
     Write-Warning ('Not running as Administrator; VSS shadow copy skipped. ' +
         'Files held open by other processes may be missed or cause errors.')
 }
+
+# ---------------------------------------------------------------------------
+# Build staging copy in system temp for more reliable reads from live trees
+# ---------------------------------------------------------------------------
+$stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ($stagingPrefix + [guid]::NewGuid().ToString('N'))
+$stagingSource = Join-Path $stagingRoot $sourceDirName
+
+Write-Host "Preparing staging directory: $stagingRoot"
+New-Item -ItemType Directory -Path $stagingSource -Force -WhatIf:$false | Out-Null
+
+Write-Host 'Staging source files ...'
+$robocopyArgs = @(
+    $compressSource,
+    $stagingSource,
+    '/E',
+    '/COPY:DAT',
+    '/DCOPY:DAT',
+    '/R:3',
+    '/W:2',
+    '/Z',
+    '/FFT',
+    '/XJ',
+    '/NP',
+    '/NFL',
+    '/NDL',
+    '/NJH',
+    '/NJS'
+)
+
+& robocopy @robocopyArgs | Out-Null
+$robocopyExitCode = $LASTEXITCODE
+if ($robocopyExitCode -ge 8) {
+    throw "Staging copy failed (Robocopy exit code $robocopyExitCode)."
+}
+
+$compressSource = $stagingSource
+$stagingReady = $true
+Write-Host "Staging complete (Robocopy exit code $robocopyExitCode)."
 
 # ---------------------------------------------------------------------------
 # Build source inventory once and run free-space pre-check
@@ -536,9 +726,35 @@ finally {
         try {
             Write-Host 'Removing VSS shadow copy ...'
             $shadowObj | Remove-CimInstance
+            $shadowIdForCleanup = $null
         }
         catch {
             Write-Warning "Failed to remove VSS shadow copy '$($shadowObj.ID)': $_"
+        }
+    }
+    elseif ($shadowIdForCleanup) {
+        try {
+            $orphanShadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$shadowIdForCleanup'" -ErrorAction SilentlyContinue
+            if ($null -ne $orphanShadow) {
+                Write-Host 'Removing VSS shadow copy (fallback by ID) ...'
+                $orphanShadow | Remove-CimInstance
+            }
+        }
+        catch {
+            Write-Warning "Failed to remove VSS shadow copy '$shadowIdForCleanup': $_"
+        }
+    }
+
+    if ($stagingRoot -and (Test-Path -LiteralPath $stagingRoot)) {
+        try {
+            Write-Host "Removing staging directory: $stagingRoot"
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction Stop -WhatIf:$false
+        }
+        catch {
+            Write-Warning "Failed to remove staging directory '$stagingRoot': $($_.Exception.Message)"
+        }
+        finally {
+            $stagingReady = $false
         }
     }
 }
@@ -563,15 +779,10 @@ $dateRegex   = "^${escapedSourceDirName}_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d
 $allBackups = Get-ChildItem -LiteralPath $DestinationPath -Filter "*.zip" |
     Where-Object { $_.Name -match $dateRegex } |
     ForEach-Object {
-        $m = [regex]::Match($_.Name, $dateRegex)
-        $fileDate = [datetime]::new(
-            [int]$m.Groups[1].Value,  # year
-            [int]$m.Groups[2].Value,  # month
-            [int]$m.Groups[3].Value,  # day
-            [int]$m.Groups[4].Value,  # hour
-            [int]$m.Groups[5].Value,  # minute
-            [int]$m.Groups[6].Value   # second
-        )
+        $fileDate = Try-ParseBackupTimestampFromName -FileName $_.Name -Pattern $dateRegex -Kind 'backup'
+        if ($null -eq $fileDate) {
+            return
+        }
         [PSCustomObject]@{
             File = $_
             Date = $fileDate
@@ -654,15 +865,10 @@ $logDateRegex = "^${escapedSourceDirName}_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\
 $allLogs = Get-ChildItem -LiteralPath $LogDirectory -Filter "*.log" |
     Where-Object { $_.Name -match $logDateRegex } |
     ForEach-Object {
-        $m = [regex]::Match($_.Name, $logDateRegex)
-        $fileDate = [datetime]::new(
-            [int]$m.Groups[1].Value,
-            [int]$m.Groups[2].Value,
-            [int]$m.Groups[3].Value,
-            [int]$m.Groups[4].Value,
-            [int]$m.Groups[5].Value,
-            [int]$m.Groups[6].Value
-        )
+        $fileDate = Try-ParseBackupTimestampFromName -FileName $_.Name -Pattern $logDateRegex -Kind 'log'
+        if ($null -eq $fileDate) {
+            return
+        }
         [PSCustomObject]@{
             File = $_
             Date = $fileDate
