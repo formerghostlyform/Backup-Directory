@@ -20,7 +20,11 @@
     Opens a folder picker dialog to choose the destination directory.
 
 .PARAMETER LogDirectory
-    Directory where run log files are written. Defaults to the current directory.
+    Directory where run log files are written. Defaults to a Logs subfolder of
+    the destination directory. Must be outside the source directory.
+    Until the log directory is ready (and when it cannot be used), the run is
+    logged under %TEMP%\Backup-Directory-Logs, so early failures such as an
+    unreachable source or destination are still recorded.
 
 .PARAMETER SendNotification
     Sends a Windows notification when the script completes (success or failure).
@@ -62,8 +66,15 @@
       VSS snapshot    - When run as Administrator, a Volume Shadow Copy is taken
                         before compression so files held open by other processes
                         are captured consistently. Gracefully skipped otherwise.
-      Free-space check- The destination drive is checked for sufficient space
-                        (source size x 1.1) before compression begins.
+      Free-space check- Before staging, the staging drive is checked for the
+                        staged copy (source size) and the destination drive for
+                        the archive (source size x 1.1). When both are on the
+                        same drive the requirements are combined.
+      Leftover cleanup- Staging directories and temporary archive/manifest files
+                        older than 2 days (from killed runs) are removed from
+                        both the temp folder and the destination. Shadow copies
+                        left behind by a killed run of the same job are removed
+                        on the next elevated run.
 #>
 
 [CmdletBinding(SupportsShouldProcess)]
@@ -76,7 +87,7 @@ param (
 
     [switch]$BrowseDestination,
 
-    [string]$LogDirectory = '.',
+    [string]$LogDirectory = '',
 
     [switch]$SendNotification,
 
@@ -197,18 +208,23 @@ function Try-ParseBackupTimestampFromName {
 function Remove-StaleStagingDirectories {
     param(
         [Parameter(Mandatory = $true)]
+        [string]$Root,
+
+        [Parameter(Mandatory = $true)]
         [string]$Prefix,
 
         [Parameter(Mandatory = $true)]
         [datetime]$OlderThan
     )
 
-    $tempRoot = [System.IO.Path]::GetTempPath()
     $removed = 0
     $failed = 0
 
-    $candidates = Get-ChildItem -LiteralPath $tempRoot -Directory -Filter ($Prefix + '*') -ErrorAction SilentlyContinue |
-        Where-Object { $_.LastWriteTime -lt $OlderThan }
+    # Only exact staging names (<prefix><32 hex chars>) are eligible, so unrelated
+    # folders that happen to share the prefix are never deleted.
+    $namePattern = '^' + [regex]::Escape($Prefix) + '[0-9a-f]{32}$'
+    $candidates = Get-ChildItem -LiteralPath $Root -Directory -Filter ($Prefix + '*') -Force -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -match $namePattern -and $_.LastWriteTime -lt $OlderThan }
 
     foreach ($dir in $candidates) {
         try {
@@ -222,8 +238,60 @@ function Remove-StaleStagingDirectories {
     }
 
     if ($removed -gt 0 -or $failed -gt 0) {
-        Write-Host ("Stale staging cleanup: removed {0}, failed {1}." -f $removed, $failed)
+        Write-Host ("Stale staging cleanup in '{0}': removed {1}, failed {2}." -f $Root, $removed, $failed)
     }
+}
+
+function Get-DirectorySizeEstimate {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Walks the tree the way the Robocopy staging copy will (/XJ skips junctions
+    # and directory symlinks). Unreadable folders are skipped; this is an estimate
+    # for the space check, not an inventory.
+    $total = 0L
+    $pending = [System.Collections.Generic.Stack[System.IO.DirectoryInfo]]::new()
+    $pending.Push([System.IO.DirectoryInfo]::new($Path))
+    while ($pending.Count -gt 0) {
+        $directory = $pending.Pop()
+        try {
+            foreach ($item in $directory.EnumerateFileSystemInfos()) {
+                if ($item -is [System.IO.DirectoryInfo]) {
+                    if (-not ($item.Attributes -band [System.IO.FileAttributes]::ReparsePoint)) {
+                        $pending.Push($item)
+                    }
+                }
+                else {
+                    $total += $item.Length
+                }
+            }
+        }
+        catch {
+            Write-Warning "Size estimate skipped '$($directory.FullName)': $($_.Exception.Message)"
+        }
+    }
+    return $total
+}
+
+function Get-VolumeFreeSpace {
+    param([Parameter(Mandatory = $true)][string]$Path)
+
+    # Returns the volume root and its free bytes; Free is $null when unknown
+    # (for example UNC paths, which have no drive letter to query).
+    $root = [System.IO.Path]::GetPathRoot($Path)
+    $free = $null
+    if ($root -match '^([A-Za-z]):\\?$') {
+        $letter = $Matches[1].ToUpperInvariant()
+        $root = "${letter}:\"
+        $drive = Get-PSDrive -Name $letter -ErrorAction SilentlyContinue
+        if ($drive -and $drive.Free) {
+            $free = [long]$drive.Free
+        }
+        else {
+            $disk = Get-CimInstance -ClassName Win32_LogicalDisk -Filter "DeviceID='${letter}:'" -ErrorAction SilentlyContinue
+            if ($disk) { $free = [long]$disk.FreeSpace }
+        }
+    }
+    return [pscustomobject]@{ Root = $root; Free = $free }
 }
 
 function Get-CanonicalDirectoryPath {
@@ -427,6 +495,8 @@ $shadowIdForCleanup = $null
 $backupJob = $null
 $tempZipPath = $null
 $tempManifestPath = $null
+$vssMarkerPath = $null
+$pendingLogDirectory = Join-Path ([System.IO.Path]::GetTempPath()) 'Backup-Directory-Logs'
 
 try {
 
@@ -436,6 +506,30 @@ try {
 if ($Help -or (-not $SourcePath -and -not $DestinationPath)) {
     Get-Help -Full $MyInvocation.MyCommand.Path
     exit 0
+}
+
+# ---------------------------------------------------------------------------
+# Start logging immediately so input, path and lock failures are recorded.
+# The log moves to the final log directory once that is known and validated.
+# ---------------------------------------------------------------------------
+$dateCode = Get-Date -Format 'yyyyMMdd_HHmmss'
+$pendingLogBaseName = [System.IO.Path]::GetFileName($SourcePath.TrimEnd([char]92, [char]'/')) -replace '[^A-Za-z0-9._-]', '_'
+if (-not $pendingLogBaseName -or $pendingLogBaseName -match '^\.*$') {
+    $pendingLogBaseName = 'Backup'
+}
+if (-not $WhatIfPreference) {
+    try {
+        [System.IO.Directory]::CreateDirectory($pendingLogDirectory) | Out-Null
+        $logFilePath = Join-Path $pendingLogDirectory "${pendingLogBaseName}_${dateCode}.log"
+        Start-Transcript -LiteralPath $logFilePath -Force | Out-Null
+        $transcriptStarted = $true
+    }
+    catch {
+        Write-Warning "Unable to start transcript logging at '$logFilePath': $($_.Exception.Message)"
+    }
+}
+else {
+    Write-Host 'WhatIf: transcript logging skipped.'
 }
 
 # ---------------------------------------------------------------------------
@@ -489,7 +583,7 @@ if (-not $resolvedSource -or -not (Test-Path -LiteralPath $resolvedSource -PathT
 }
 $SourcePath = $resolvedSource.Path
 $sourceDirName = (Get-Item -LiteralPath $SourcePath -Force).Name
-$dateCode      = Get-Date -Format 'yyyyMMdd_HHmmss'
+$escapedSourceDirName = [regex]::Escape($sourceDirName)
 
 # Reject overlaps before creating any output inside the source tree.
 $destinationFullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestinationPath)
@@ -497,11 +591,56 @@ if (Test-PathWithinDirectory -Path $destinationFullPath -Directory $SourcePath) 
     throw 'DestinationPath must be outside the source directory to prevent backing up previous backups.'
 }
 
+if (-not $LogDirectory) {
+    $LogDirectory = Join-Path $destinationFullPath 'Logs'
+}
+$LogDirectory = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($LogDirectory)
+if (Test-PathWithinDirectory -Path $LogDirectory -Directory $SourcePath) {
+    throw 'LogDirectory must be outside the source directory so open log files are not backed up.'
+}
+
 if (-not (Test-Path -LiteralPath $DestinationPath)) {
     Write-Host "Destination directory does not exist; creating: $DestinationPath"
     New-Item -ItemType Directory -Path $DestinationPath -Force -WhatIf:$false | Out-Null
 }
 $DestinationPath = (Resolve-Path -Path $DestinationPath).Path
+
+# ---------------------------------------------------------------------------
+# Move the run log from the pending location to the final log directory.
+# Logging problems never fail the backup; the pending log is kept instead.
+# ---------------------------------------------------------------------------
+if (-not $WhatIfPreference) {
+    $finalLogPath = Join-Path $LogDirectory "${sourceDirName}_${dateCode}.log"
+    try {
+        if (-not (Test-Path -LiteralPath $LogDirectory -PathType Container)) {
+            Write-Host "Log directory does not exist; creating: $LogDirectory"
+            [System.IO.Directory]::CreateDirectory($LogDirectory) | Out-Null
+        }
+        if ($transcriptStarted) {
+            Stop-Transcript | Out-Null
+            $transcriptStarted = $false
+            Move-Item -LiteralPath $logFilePath -Destination $finalLogPath -Force -WhatIf:$false
+        }
+        $logFilePath = $finalLogPath
+    }
+    catch {
+        Write-Warning "Unable to use log directory '$LogDirectory': $($_.Exception.Message)"
+    }
+    finally {
+        if (-not $transcriptStarted -and $logFilePath) {
+            try {
+                Start-Transcript -LiteralPath $logFilePath -Append | Out-Null
+                $transcriptStarted = $true
+            }
+            catch {
+                Write-Warning "Unable to resume transcript logging at '$logFilePath': $($_.Exception.Message)"
+            }
+        }
+    }
+    if ($transcriptStarted) {
+        Write-Host "Logging to '$logFilePath'"
+    }
+}
 
 $stagingParent = [System.IO.Path]::GetTempPath()
 if (Test-PathWithinDirectory -Path $stagingParent -Directory $SourcePath) {
@@ -548,39 +687,102 @@ if (-not $runLockAcquired) {
 
 Write-Host 'Execution lock acquired for this backup job.'
 
+# ---------------------------------------------------------------------------
+# Remove leftovers from killed or crashed runs
+# ---------------------------------------------------------------------------
+# Staging directories can live in system temp or, with the fallback, in the
+# destination. The age threshold protects concurrent jobs sharing a folder.
 $staleCutoff = (Get-Date).AddDays(-$staleStagingRetentionDays)
-Remove-StaleStagingDirectories -Prefix $stagingPrefix -OlderThan $staleCutoff
+Remove-StaleStagingDirectories -Root ([System.IO.Path]::GetTempPath()) -Prefix $stagingPrefix -OlderThan $staleCutoff
+Remove-StaleStagingDirectories -Root $DestinationPath -Prefix $stagingPrefix -OlderThan $staleCutoff
 
-if (-not (Test-Path -LiteralPath $LogDirectory)) {
-    Write-Host "Log directory does not exist; creating: $LogDirectory"
-    New-Item -ItemType Directory -Path $LogDirectory -Force -WhatIf:$false | Out-Null
-}
-$LogDirectory = (Resolve-Path -Path $LogDirectory).Path
+$staleTempFilePattern = "^${escapedSourceDirName}_\d{8}_\d{6}\.(tmp\.zip|manifest\.sha256\.tmp)$"
+Get-ChildItem -LiteralPath $DestinationPath -File -Force -ErrorAction SilentlyContinue |
+    Where-Object { $_.Name -match $staleTempFilePattern -and $_.LastWriteTime -lt $staleCutoff } |
+    ForEach-Object {
+        try {
+            Remove-Item -LiteralPath $_.FullName -Force -ErrorAction Stop -WhatIf:$false
+            Write-Host "Removed stale temporary file: $($_.Name)"
+        }
+        catch {
+            Write-Warning "Failed to remove stale temporary file '$($_.Name)': $($_.Exception.Message)"
+        }
+    }
 
-$logFileName = "${sourceDirName}_${dateCode}.log"
-$logFilePath = Join-Path $LogDirectory $logFileName
-if (-not $WhatIfPreference) {
-    try {
-        Start-Transcript -Path $logFilePath -Force | Out-Null
-        $transcriptStarted = $true
-        Write-Host "Logging to '$logFilePath'"
+$currentIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentPrincipal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
+$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+# Each snapshot's ID is recorded in a marker file (one per run) until the
+# snapshot is removed. A surviving marker means a run of this job was killed.
+# Only IDs this job recorded are ever removed, never other snapshots.
+$vssMarkerPrefix = '.backupdirectory-{0}-' -f $mutexHash.Substring(0, 16).ToLowerInvariant()
+$orphanMarkers = @(Get-ChildItem -LiteralPath $DestinationPath -Filter ($vssMarkerPrefix + '*.vss') -File -Force -ErrorAction SilentlyContinue)
+foreach ($marker in $orphanMarkers) {
+    $orphanId = ([string](Get-Content -LiteralPath $marker.FullName -Raw)).Trim()
+    if ($orphanId -notmatch '^\{[0-9A-Fa-f]{8}(-[0-9A-Fa-f]{4}){3}-[0-9A-Fa-f]{12}\}$') {
+        Write-Warning "Removing shadow copy marker with an invalid ID: '$($marker.Name)'"
+        Remove-Item -LiteralPath $marker.FullName -Force -ErrorAction SilentlyContinue -WhatIf:$false
     }
-    catch {
-        Write-Warning "Unable to start transcript logging at '$logFilePath': $($_.Exception.Message)"
+    elseif (-not $isAdmin) {
+        Write-Warning ("A previous run left shadow copy $orphanId behind. " +
+            'Run elevated once to remove it automatically.')
+    }
+    else {
+        try {
+            $orphans = @(Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$orphanId'" -ErrorAction Stop |
+                Where-Object { $_.ID -eq $orphanId })
+            foreach ($orphan in $orphans) {
+                Write-Host "Removing shadow copy left by a previous run: $orphanId"
+                $orphan | Remove-CimInstance -WhatIf:$false -Confirm:$false
+            }
+            Remove-Item -LiteralPath $marker.FullName -Force -WhatIf:$false
+        }
+        catch {
+            Write-Warning "Failed to remove shadow copy '$orphanId' left by a previous run: $($_.Exception.Message)"
+        }
     }
 }
-else {
-    Write-Host "WhatIf: transcript logging skipped."
+$vssMarkerPath = Join-Path $DestinationPath ($vssMarkerPrefix + [guid]::NewGuid().ToString('N') + '.vss')
+
+# ---------------------------------------------------------------------------
+# Free-space pre-check (before any snapshot or staging copy is created)
+# ---------------------------------------------------------------------------
+Write-Host 'Estimating source size ...'
+$estimatedSourceSize = Get-DirectorySizeEstimate -Path $SourcePath
+
+Write-Host 'Checking available disk space ...'
+$spaceNeeds = [ordered]@{}
+foreach ($need in @(
+        @{ Path = $stagingParent;   Purpose = 'staging copy'; Bytes = [long]$estimatedSourceSize },
+        @{ Path = $DestinationPath; Purpose = 'archive';      Bytes = [long][math]::Ceiling($estimatedSourceSize * 1.1) })) {
+    $volume = Get-VolumeFreeSpace -Path $need.Path
+    $key = $volume.Root.ToUpperInvariant()
+    if (-not $spaceNeeds.Contains($key)) {
+        $spaceNeeds[$key] = [pscustomobject]@{ Root = $volume.Root; Free = $volume.Free; Bytes = 0L; Purposes = @() }
+    }
+    $spaceNeeds[$key].Bytes += $need.Bytes
+    $spaceNeeds[$key].Purposes += $need.Purpose
+}
+
+foreach ($entry in $spaceNeeds.Values) {
+    $purposes = $entry.Purposes -join ' + '
+    if ($null -eq $entry.Free) {
+        Write-Warning "Could not determine free space on '$($entry.Root)' ($purposes); skipping space check."
+        continue
+    }
+    if ($entry.Free -lt $entry.Bytes) {
+        throw ("Insufficient disk space on '{0}' for {1}. Required: {2:N0} MB, Available: {3:N0} MB." -f
+            $entry.Root, $purposes, [math]::Ceiling($entry.Bytes / 1MB), [math]::Floor($entry.Free / 1MB))
+    }
+    Write-Host ("Space check passed on '{0}' ({1}). Required ~{2:N0} MB, available {3:N0} MB." -f
+        $entry.Root, $purposes, [math]::Ceiling($entry.Bytes / 1MB), [math]::Floor($entry.Free / 1MB))
 }
 
 # ---------------------------------------------------------------------------
 # VSS shadow copy (requires elevation; falls back gracefully if unavailable)
 # ---------------------------------------------------------------------------
 $compressSource = $SourcePath
-
-$currentIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
-$currentPrincipal = New-Object Security.Principal.WindowsPrincipal($currentIdentity)
-$isAdmin = $currentPrincipal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
 if ($isAdmin) {
     try {
@@ -621,6 +823,12 @@ if ($isAdmin) {
             }
 
             $shadowIdForCleanup = $shadowId
+            try {
+                Set-Content -LiteralPath $vssMarkerPath -Value $shadowId -Encoding ascii -WhatIf:$false
+            }
+            catch {
+                Write-Warning "Unable to record shadow copy ID for crash recovery: $($_.Exception.Message)"
+            }
 
             $shadowObj = Get-CimInstance -ClassName Win32_ShadowCopy | Where-Object { $_.ID -eq $shadowId } | Select-Object -First 1
             if ($null -eq $shadowObj -or -not $shadowObj.DeviceObject) {
@@ -692,37 +900,10 @@ $compressSource = $stagingSource
 Write-Host "Staging complete (Robocopy exit code $robocopyExitCode)."
 
 # ---------------------------------------------------------------------------
-# Build source inventory once and run free-space pre-check
+# Build the staged file inventory once (used for archive validation)
 # ---------------------------------------------------------------------------
 Write-Host 'Indexing source files ...'
 $sourceFiles = @(Get-ChildItem -LiteralPath $compressSource -Recurse -File -Force | Sort-Object -Property FullName)
-$sourceSize = 0L
-if ($sourceFiles.Count -gt 0) {
-    $sourceSize = ($sourceFiles | Measure-Object -Property Length -Sum).Sum
-}
-
-Write-Host 'Checking available disk space ...'
-$destDrive = Split-Path -Qualifier $DestinationPath
-$freeSpace = (Get-PSDrive -Name $destDrive.TrimEnd(':') -ErrorAction SilentlyContinue).Free
-if (-not $freeSpace) {
-    $disk      = Get-CimInstance -ClassName Win32_LogicalDisk `
-                     -Filter "DeviceID='$destDrive'" -ErrorAction SilentlyContinue
-    $freeSpace = if ($disk) { $disk.FreeSpace } else { $null }
-}
-
-if ($null -ne $freeSpace) {
-    $requiredSpace = [long]($sourceSize * 1.1)
-    if ($freeSpace -lt $requiredSpace) {
-        Write-Error ("Insufficient disk space on destination. " +
-            "Required: {0:N0} MB, Available: {1:N0} MB." -f
-            [math]::Ceiling($requiredSpace / 1MB), [math]::Floor($freeSpace / 1MB))
-        exit 1
-    }
-    Write-Host ("Space check passed. Required ~{0:N0} MB, available {1:N0} MB." -f
-        [math]::Ceiling($requiredSpace / 1MB), [math]::Floor($freeSpace / 1MB))
-} else {
-    Write-Warning 'Could not determine available disk space; skipping space check.'
-}
 
 # ---------------------------------------------------------------------------
 # Create backup (atomic: write to .tmp, rename to final name after validation)
@@ -828,7 +1009,6 @@ $cutoffYearly  = $now.AddYears(-5)           # keep one-per-YEAR between here an
 
 # Match files produced by this script for the same source directory name.
 # Expected pattern: <DirName>_yyyyMMdd_HHmmss.zip
-$escapedSourceDirName = [regex]::Escape($sourceDirName)
 $dateRegex   = "^${escapedSourceDirName}_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.zip$"
 
 # Build a list of backup objects with parsed dates
@@ -918,19 +1098,24 @@ if ($WhatIfPreference) {
 # ---------------------------------------------------------------------------
 $logDateRegex = "^${escapedSourceDirName}_(\d{4})(\d{2})(\d{2})_(\d{2})(\d{2})(\d{2})\.log$"
 
-$allLogs = Get-ChildItem -LiteralPath $LogDirectory -Filter "*.log" |
-    Where-Object { $_.Name -match $logDateRegex } |
-    ForEach-Object {
-        $fileDate = Try-ParseBackupTimestampFromName -FileName $_.Name -Pattern $logDateRegex -Kind 'log'
-        if ($null -eq $fileDate) {
-            return
-        }
-        [PSCustomObject]@{
-            File = $_
-            Date = $fileDate
-        }
-    } |
-    Sort-Object -Property Date
+# The log directory may not exist when logging fell back to the pending location
+# or was skipped (-WhatIf).
+$allLogs = @()
+if (Test-Path -LiteralPath $LogDirectory -PathType Container) {
+    $allLogs = Get-ChildItem -LiteralPath $LogDirectory -Filter "*.log" |
+        Where-Object { $_.Name -match $logDateRegex } |
+        ForEach-Object {
+            $fileDate = Try-ParseBackupTimestampFromName -FileName $_.Name -Pattern $logDateRegex -Kind 'log'
+            if ($null -eq $fileDate) {
+                return
+            }
+            [PSCustomObject]@{
+                File = $_
+                Date = $fileDate
+            }
+        } |
+        Sort-Object -Property Date
+}
 
 $keepLogPaths = [System.Collections.Generic.HashSet[string]]::new(
     [System.StringComparer]::OrdinalIgnoreCase
@@ -989,6 +1174,9 @@ catch {
     $notificationTitle = 'Backup Failed'
     $notificationMessage = $_.Exception.Message
     Write-Error "Backup failed: $($_.Exception.Message)" -ErrorAction Continue
+    if ($transcriptStarted) {
+        Write-Host "Run log: $logFilePath"
+    }
     exit 1
 }
 finally {
@@ -1022,15 +1210,21 @@ finally {
     }
     if ($shadowIdForCleanup) {
         try {
-            $orphanShadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$shadowIdForCleanup'" -ErrorAction SilentlyContinue
+            $orphanShadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$shadowIdForCleanup'" -ErrorAction Stop
             if ($null -ne $orphanShadow) {
                 Write-Host 'Removing VSS shadow copy (fallback by ID) ...'
                 $orphanShadow | Remove-CimInstance -WhatIf:$false -Confirm:$false
             }
+            $shadowIdForCleanup = $null
         }
         catch {
             Write-Warning "Failed to remove VSS shadow copy '$shadowIdForCleanup': $_"
         }
+    }
+    # Keep this run's marker only while its snapshot may still exist, so the
+    # next elevated run of this job can remove it.
+    if ($vssMarkerPath -and -not $shadowIdForCleanup -and (Test-Path -LiteralPath $vssMarkerPath -PathType Leaf)) {
+        Remove-Item -LiteralPath $vssMarkerPath -Force -ErrorAction SilentlyContinue -WhatIf:$false
     }
 
     if ($stagingRoot -and (Test-Path -LiteralPath $stagingRoot)) {

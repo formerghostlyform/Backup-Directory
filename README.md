@@ -13,7 +13,7 @@ PowerShell script to create timestamped ZIP backups of a source directory and au
 
 3. Verify output:
 	- A new ZIP appears in your destination folder
-	- A log file is written (default: current directory)
+	- A log file is written (default: a `Logs` folder inside the destination)
 
 ## Run Daily With Task Scheduler
 
@@ -45,7 +45,7 @@ Unregister-ScheduledTask -TaskName "Backup MyApp Directory" -Confirm:$false
 - Creates a ZIP backup named like `<SourceDirName>_yyyyMMdd_HHmmss.zip`
 - Includes hidden files, hidden folders, and empty directories
 - Stores backups in the destination directory
-- Writes logs to a configurable log directory
+- Writes logs to a configurable log directory (default: `<Destination>\Logs`)
 - Optionally sends a Windows notification on completion
 - Cleans up old backup ZIP files based on retention rules
 
@@ -67,7 +67,9 @@ Only ZIP files that match the expected naming format are managed. Other files in
 - Checksum manifest: records the validated file hashes and the completed archive's SHA-256 hash
 - Concurrency lock: prevents overlapping runs for the same source/destination pair
 - VSS snapshot: uses Volume Shadow Copy when running as Administrator (skips gracefully otherwise)
-- Free-space check: verifies destination has enough space before compression
+- Free-space check: before staging, verifies the staging drive has room for the staged copy and the destination drive has room for the archive (source size x 1.1); requirements are combined when both are on the same drive. Skipped with a warning when free space can't be determined (for example UNC paths)
+- Leftover cleanup: removes staging folders and temporary archive/manifest files older than 2 days (from killed runs) in both system temp and the destination; shadow copies left by a killed run of the same job are removed on the next elevated run
+- Early logging: the run is logged from the start, so failures before the log directory is ready (missing source, unreachable destination, lock conflicts) are still recorded
 - Resource cleanup: releases staging directories, temporary output, background jobs, and VSS snapshots even when a run fails before compression
 
 ## Requirements
@@ -141,12 +143,15 @@ The script supports PowerShell `-WhatIf` behavior for cleanup/delete operations:
 
 - The backup destination must be outside the source directory. Destinations equal to or inside the source are rejected before output is created, including overlaps through directory junctions and Windows short-path aliases.
 - Staging normally uses system temp. If that folder is inside the source, staging uses the backup destination instead, which needs room for both the staged copy and the archive.
+- Logs default to `<Destination>\Logs`. The log directory must be outside the source; a log directory inside the source is rejected.
+- Until the log directory is ready, the run is logged under `%TEMP%\Backup-Directory-Logs` and then moved. If the run fails first (or the log directory can't be used), the log stays there. For a task running as SYSTEM that is `C:\Windows\Temp\Backup-Directory-Logs`. The console output ends with `Run log: <path>` on failure.
+- Shadow copy IDs are tracked in small `.backupdirectory-*.vss` marker files in the destination until each snapshot is removed. Leave them in place so a killed run's snapshot can be cleaned up automatically.
 - Running as Administrator improves consistency for open/in-use files due to VSS snapshot support.
 - If another identical backup job is already running (same script, source, destination), a second run will be blocked.
 
 ## Regression Tests
 
-The dependency-free test suite creates and removes isolated temporary fixtures. VSS calls are mocked; no real snapshots are created or deleted. It covers hidden files, empty directories, overlapping paths, archive-content validation, and cleanup after injected failures.
+The dependency-free test suite creates and removes isolated temporary fixtures. VSS calls are mocked; no real snapshots are created or deleted. It covers hidden files, empty directories, overlapping paths, log directory placement and early logging, stale leftover cleanup, archive-content validation, and cleanup after injected failures.
 
 Run with either supported PowerShell version:
 

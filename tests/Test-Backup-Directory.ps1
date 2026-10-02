@@ -32,16 +32,20 @@ function New-Fixture {
 }
 
 function Invoke-Fixture {
-    param($Fixture, [string]$Fault = 'None', [string]$Destination = '', [string]$Temp = '')
+    param($Fixture, [string]$Fault = 'None', [string]$Destination = '', [string]$Temp = '',
+        [string]$Source = '', [string]$Logs = '')
     if (-not $Destination) { $Destination = $Fixture.Destination }
     if (-not $Temp) { $Temp = $Fixture.Temp }
+    if (-not $Source) { $Source = $Fixture.Source }
+    # 'DEFAULT' omits -LogDirectory (empty arguments are dropped by Windows PowerShell).
+    if (-not $Logs) { $Logs = $Fixture.Logs }
     $previousPreference = $ErrorActionPreference
     try {
         # Expected failures write to stderr in Windows PowerShell.
         $ErrorActionPreference = 'Continue'
         $output = & $PowerShellExecutable -NoProfile -NonInteractive -ExecutionPolicy Bypass -File $wrapper `
-            -BackupScript $backupScript -Source $Fixture.Source -Destination $Destination `
-            -Logs $Fixture.Logs -Temp $Temp -Marker $Fixture.Marker -Fault $Fault 2>&1
+            -BackupScript $backupScript -Source $Source -Destination $Destination `
+            -Logs $Logs -Temp $Temp -Marker $Fixture.Marker -Fault $Fault 2>&1
         $code = $LASTEXITCODE
     }
     finally { $ErrorActionPreference = $previousPreference }
@@ -53,9 +57,11 @@ function Assert-NoResources {
     $stagingDirectories = @(Get-ChildItem -LiteralPath $Fixture.Root -Directory -Recurse -Force |
         Where-Object { $_.Name -like 'BackupDirectory_*' -or $_.Name -like 'BackupDirectoryCompiler_*' })
     Assert-True ($stagingDirectories.Count -eq 0) "Temporary directories leaked: $($Result.Output)"
-    $partialFiles = @(Get-ChildItem -LiteralPath $Fixture.Destination -File -Force |
-        Where-Object { $_.Name -like '*.tmp*' })
-    Assert-True ($partialFiles.Count -eq 0) "Partial output leaked: $($Result.Output)"
+    if (Test-Path -LiteralPath $Fixture.Destination) {
+        $partialFiles = @(Get-ChildItem -LiteralPath $Fixture.Destination -File -Force |
+            Where-Object { $_.Name -like '*.tmp*' -or $_.Name -like '.backupdirectory-*.vss' })
+        Assert-True ($partialFiles.Count -eq 0) "Partial output or snapshot marker leaked: $($Result.Output)"
+    }
     if ($ExpectSnapshot) {
         Assert-True (Test-Path -LiteralPath $Fixture.Marker) "Snapshot was not released: $($Result.Output)"
     }
@@ -171,7 +177,9 @@ if ($Fault -eq 'ArchiveMismatch') {
         }
     }
 }
-& $BackupScript -SourcePath $Source -DestinationPath $Destination -LogDirectory $Logs
+$logArguments = @{}
+if ($Logs -ne 'DEFAULT') { $logArguments.LogDirectory = $Logs }
+& $BackupScript -SourcePath $Source -DestinationPath $Destination @logArguments
 if ($?) { exit 0 } else { exit 1 }
 '@ | Set-Content -LiteralPath $wrapper -Encoding UTF8
 
@@ -300,9 +308,82 @@ if ($?) { exit 0 } else { exit 1 }
             Assert-True ($result.Output -match $expectedMessage) "Wrong failure for ${fault}: $($result.Output)"
             Assert-True (@(Get-ChildItem -LiteralPath $fixture.Destination -Filter '*.zip' -File).Count -eq 0) 'Failed backup was promoted to final ZIP.'
         }
-        Assert-NoResources $fixture $result $true
+        # The space check now runs before any snapshot is created.
+        Assert-NoResources $fixture $result ($fault -ne 'NoSpace')
         Pass "$fault releases staging, temporary output and snapshot"
     }
+
+    $fixture = New-Fixture 'log-moves-to-final'
+    [System.IO.File]::WriteAllText((Join-Path $fixture.Source 'file.txt'), 'payload')
+    # A new destination makes the run write output before the log directory is ready.
+    $newDestination = Join-Path $fixture.Root 'NewDestination'
+    $result = Invoke-Fixture $fixture -Destination $newDestination
+    Assert-True ($result.ExitCode -eq 0) "Backup failed: $($result.Output)"
+    Assert-True (@(Get-ChildItem -LiteralPath $newDestination -Filter '*.zip' -File).Count -eq 1) 'Expected exactly one completed ZIP.'
+    $finalLogs = @(Get-ChildItem -LiteralPath $fixture.Logs -Filter 'Source_*.log' -File)
+    Assert-True ($finalLogs.Count -eq 1) "Expected one run log in the log directory: $($result.Output)"
+    Assert-True ((Get-Content -LiteralPath $finalLogs[0].FullName -Raw) -match 'Destination directory does not exist') 'Run log is missing output written before the log directory was ready.'
+    $pendingDirectory = Join-Path $fixture.Temp 'Backup-Directory-Logs'
+    $pendingLogs = @(Get-ChildItem -LiteralPath $pendingDirectory -Filter '*.log' -File -ErrorAction SilentlyContinue)
+    Assert-True ($pendingLogs.Count -eq 0) 'Pending log was not moved to the log directory.'
+    Assert-NoResources $fixture $result $true
+    Pass 'Run log starts early and moves to the log directory'
+
+    $fixture = New-Fixture 'log-default'
+    [System.IO.File]::WriteAllText((Join-Path $fixture.Source 'file.txt'), 'payload')
+    $result = Invoke-Fixture $fixture -Logs 'DEFAULT'
+    $archive = Get-FixtureArchive $fixture $result
+    $archive.Dispose()
+    $defaultLogs = @(Get-ChildItem -LiteralPath (Join-Path $fixture.Destination 'Logs') -Filter 'Source_*.log' -File -ErrorAction SilentlyContinue)
+    Assert-True ($defaultLogs.Count -eq 1) "Default log directory not used: $($result.Output)"
+    Assert-NoResources $fixture $result $true
+    Pass 'Default log directory is Destination\Logs'
+
+    $fixture = New-Fixture 'log-inside-source'
+    $insideLogs = Join-Path $fixture.Source 'Logs'
+    $result = Invoke-Fixture $fixture -Logs $insideLogs
+    Assert-True ($result.ExitCode -ne 0 -and $result.Output -match 'LogDirectory must be outside') "Log directory inside source was accepted: $($result.Output)"
+    Assert-True (-not (Test-Path -LiteralPath $insideLogs)) 'Rejected log directory was created.'
+    Assert-True (@(Get-ChildItem -LiteralPath $fixture.Destination -Filter '*.zip' -File).Count -eq 0) 'Backup ran with a rejected log directory.'
+    Assert-NoResources $fixture $result
+    Pass 'Reject log directory inside source'
+
+    $fixture = New-Fixture 'early-failure-logged'
+    $result = Invoke-Fixture $fixture -Source (Join-Path $fixture.Root 'Missing')
+    Assert-True ($result.ExitCode -ne 0) 'Missing source unexpectedly succeeded.'
+    $pendingLogs = @(Get-ChildItem -LiteralPath (Join-Path $fixture.Temp 'Backup-Directory-Logs') -Filter 'Missing_*.log' -File -ErrorAction SilentlyContinue)
+    Assert-True ($pendingLogs.Count -eq 1) "Early failure was not logged: $($result.Output)"
+    Assert-True ((Get-Content -LiteralPath $pendingLogs[0].FullName -Raw) -match 'Source directory not found') 'Early failure log is missing the error.'
+    Assert-NoResources $fixture $result
+    Pass 'Failure before the log directory is ready is still logged'
+
+    $fixture = New-Fixture 'stale-leftovers'
+    [System.IO.File]::WriteAllText((Join-Path $fixture.Source 'file.txt'), 'payload')
+    $old = (Get-Date).AddDays(-5)
+    $staleStaging = Join-Path $fixture.Destination ('BackupDirectory_' + [guid]::NewGuid().ToString('N'))
+    [System.IO.Directory]::CreateDirectory($staleStaging) | Out-Null
+    [System.IO.Directory]::SetLastWriteTime($staleStaging, $old)
+    $unrelated = Join-Path $fixture.Destination 'BackupDirectory_keep'
+    [System.IO.Directory]::CreateDirectory($unrelated) | Out-Null
+    [System.IO.Directory]::SetLastWriteTime($unrelated, $old)
+    $staleFiles = @(
+        (Join-Path $fixture.Destination 'Source_20200101_000000.tmp.zip'),
+        (Join-Path $fixture.Destination 'Source_20200101_000000.manifest.sha256.tmp'))
+    foreach ($staleFile in $staleFiles) {
+        [System.IO.File]::WriteAllText($staleFile, 'partial')
+        [System.IO.File]::SetLastWriteTime($staleFile, $old)
+    }
+    $result = Invoke-Fixture $fixture
+    $archive = Get-FixtureArchive $fixture $result
+    $archive.Dispose()
+    Assert-True (-not (Test-Path -LiteralPath $staleStaging)) 'Stale staging directory in destination was not removed.'
+    Assert-True (Test-Path -LiteralPath $unrelated) 'Unrelated directory was removed.'
+    foreach ($staleFile in $staleFiles) {
+        Assert-True (-not (Test-Path -LiteralPath $staleFile)) "Stale temporary file was not removed: $staleFile"
+    }
+    [System.IO.Directory]::Delete($unrelated)
+    Assert-NoResources $fixture $result $true
+    Pass 'Stale staging directories and temporary files in destination are removed'
 
     # Load only the validation helper, never the script's executable body.
     $tokens = $null; $parseErrors = $null
