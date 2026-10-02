@@ -226,6 +226,188 @@ function Remove-StaleStagingDirectories {
     }
 }
 
+function Get-CanonicalDirectoryPath {
+    param([string]$Path)
+
+    # Resolve existing directories through Windows handles. This handles short
+    # (8.3) names and directory junctions that lexical path comparison misses.
+    if (-not ('BackupDirectory.NativePaths' -as [type])) {
+        $nativeDefinition = @'
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+using System.Text;
+using Microsoft.Win32.SafeHandles;
+namespace BackupDirectory {
+    public static class NativePaths {
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern SafeFileHandle CreateFileW(string name, uint access,
+            uint share, IntPtr security, uint creation, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern uint GetFinalPathNameByHandleW(SafeFileHandle handle,
+            StringBuilder path, uint size, uint flags);
+        public static string Resolve(string path) {
+            using (SafeFileHandle handle = CreateFileW(path, 0, 7, IntPtr.Zero,
+                3, 0x02000000, IntPtr.Zero)) {
+                if (handle.IsInvalid) throw new Win32Exception(Marshal.GetLastWin32Error());
+                StringBuilder result = new StringBuilder(32768);
+                uint length = GetFinalPathNameByHandleW(handle, result, (uint)result.Capacity, 0);
+                if (length == 0) throw new Win32Exception(Marshal.GetLastWin32Error());
+                if (length >= result.Capacity) throw new System.IO.PathTooLongException();
+                string resolved = result.ToString();
+                if (resolved.StartsWith(@"\\?\UNC\", StringComparison.OrdinalIgnoreCase))
+                    return @"\\" + resolved.Substring(8);
+                if (resolved.StartsWith(@"\\?\", StringComparison.Ordinal))
+                    return resolved.Substring(4);
+                return resolved;
+            }
+        }
+    }
+}
+'@
+        if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            # Resolve temp junctions before invoking .NET Framework's compiler,
+            # which cannot create its scratch files through a junction path.
+            $compilerParent = [System.IO.Path]::GetFullPath([System.IO.Path]::GetTempPath())
+            $ancestor = $compilerParent
+            $redirects = 0
+            while ($ancestor) {
+                $ancestorItem = Get-Item -LiteralPath $ancestor -Force
+                if (($ancestorItem.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and
+                    $ancestorItem.PSObject.Properties['Target'] -and $ancestorItem.Target) {
+                    if (++$redirects -gt 40) { throw 'Unable to resolve compiler temp directory links.' }
+                    $target = @($ancestorItem.Target)[0]
+                    if (-not [System.IO.Path]::IsPathRooted($target)) {
+                        $target = [System.IO.Path]::Combine([System.IO.Path]::GetDirectoryName($ancestor), $target)
+                    }
+                    $suffix = $compilerParent.Substring($ancestor.Length).TrimStart([char]92, [char]'/')
+                    $compilerParent = [System.IO.Path]::GetFullPath([System.IO.Path]::Combine($target, $suffix))
+                    $ancestor = $compilerParent
+                    continue
+                }
+                $ancestor = [System.IO.Path]::GetDirectoryName($ancestor.TrimEnd([char]92, [char]'/'))
+            }
+            $compilerDirectory = Join-Path $compilerParent ('BackupDirectoryCompiler_' + [guid]::NewGuid().ToString('N'))
+            [System.IO.Directory]::CreateDirectory($compilerDirectory) | Out-Null
+            $previousCompilerTemp = $env:TEMP
+            $previousCompilerTmp = $env:TMP
+            try {
+                $env:TEMP = $compilerDirectory
+                $env:TMP = $compilerDirectory
+                $compilerParameters = [System.CodeDom.Compiler.CompilerParameters]::new()
+                $compilerParameters.GenerateInMemory = $true
+                $compilerParameters.ReferencedAssemblies.Add([System.ComponentModel.Win32Exception].Assembly.Location) | Out-Null
+                $compilerParameters.TempFiles = [System.CodeDom.Compiler.TempFileCollection]::new($compilerDirectory)
+                Add-Type -TypeDefinition $nativeDefinition -CompilerParameters $compilerParameters
+            }
+            finally {
+                $env:TEMP = $previousCompilerTemp
+                $env:TMP = $previousCompilerTmp
+                if ([System.IO.Directory]::Exists($compilerDirectory)) {
+                    [System.IO.Directory]::Delete($compilerDirectory, $true)
+                }
+            }
+        }
+        else {
+            Add-Type -TypeDefinition $nativeDefinition
+        }
+    }
+
+    $fullPath = [System.IO.Path]::GetFullPath($Path)
+    $suffix = [System.Collections.Generic.List[string]]::new()
+    while (-not [System.IO.Directory]::Exists($fullPath)) {
+        if ([System.IO.File]::Exists($fullPath)) { throw "Expected a directory: '$fullPath'." }
+        $leaf = [System.IO.Path]::GetFileName($fullPath.TrimEnd([char]92, [char]'/'))
+        $parent = [System.IO.Path]::GetDirectoryName($fullPath.TrimEnd([char]92, [char]'/'))
+        if (-not $parent) { throw "Cannot resolve directory path: '$Path'." }
+        $suffix.Insert(0, $leaf)
+        $fullPath = $parent
+    }
+    $canonical = [BackupDirectory.NativePaths]::Resolve($fullPath)
+    foreach ($leaf in $suffix) { $canonical = [System.IO.Path]::Combine($canonical, $leaf) }
+    return $canonical
+}
+
+function Test-PathWithinDirectory {
+    param([string]$Path, [string]$Directory)
+
+    $normalizedPath = (Get-CanonicalDirectoryPath $Path).TrimEnd([char]92, [char]'/')
+    $normalizedDirectory = (Get-CanonicalDirectoryPath $Directory).TrimEnd([char]92, [char]'/')
+    return $normalizedPath.Equals($normalizedDirectory, [System.StringComparison]::OrdinalIgnoreCase) -or
+        $normalizedPath.StartsWith($normalizedDirectory + [System.IO.Path]::DirectorySeparatorChar,
+            [System.StringComparison]::OrdinalIgnoreCase)
+}
+
+function Test-BackupArchive {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$ArchivePath,
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDirectory,
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDirectoryName,
+        [Parameter(Mandatory = $true)]
+        [AllowEmptyCollection()]
+        [System.IO.FileInfo[]]$SourceFiles
+    )
+
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ArchivePath)
+    try {
+        $entryTable = @{}
+        foreach ($entry in $archive.Entries) {
+            if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) { continue }
+            $key = $entry.FullName.Replace('\', '/')
+            if ($entryTable.ContainsKey($key)) {
+                throw "Validation failed: duplicate archive entry '$key'."
+            }
+            $entryTable[$key] = $entry
+        }
+
+        $validatedFiles = [System.Collections.Generic.List[object]]::new()
+        foreach ($file in $SourceFiles) {
+            $relative = $file.FullName.Substring($SourceDirectory.Length).TrimStart([char]92, [char]'/').Replace('\', '/')
+            $entryKey = "$SourceDirectoryName/$relative"
+            if (-not $entryTable.ContainsKey($entryKey)) {
+                throw "Validation failed: file missing from archive: '$relative'."
+            }
+
+            $entry = $entryTable[$entryKey]
+            if ($entry.Length -ne $file.Length) {
+                throw "Validation failed: size mismatch for '$relative'."
+            }
+            $sourceHash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
+            $entryStream = $entry.Open()
+            $hasher = [System.Security.Cryptography.SHA256]::Create()
+            try {
+                # Reading the entire entry also detects decompression/read failures.
+                $entryHash = [System.BitConverter]::ToString($hasher.ComputeHash($entryStream)).Replace('-', '')
+            }
+            finally {
+                $hasher.Dispose()
+                $entryStream.Dispose()
+            }
+            if ($entryHash -ne $sourceHash) {
+                throw "Validation failed: SHA-256 mismatch for '$relative'."
+            }
+            $validatedFiles.Add([pscustomobject]@{
+                RelativePath = $relative
+                SizeBytes = $file.Length
+                SHA256 = $entryHash
+            })
+            $entryTable.Remove($entryKey)
+        }
+
+        if ($entryTable.Count -ne 0) {
+            throw "Validation failed: archive contains unexpected files: $($entryTable.Keys -join ', ')."
+        }
+        return [pscustomobject]@{ EntryCount = $validatedFiles.Count; Files = $validatedFiles }
+    }
+    finally {
+        $archive.Dispose()
+    }
+}
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 $transcriptStarted = $false
@@ -240,7 +422,11 @@ $stagingPrefix = 'BackupDirectory_'
 $staleStagingRetentionDays = 2
 $stagingRoot = $null
 $stagingSource = $null
-$stagingReady = $false
+$shadowObj = $null
+$shadowIdForCleanup = $null
+$backupJob = $null
+$tempZipPath = $null
+$tempManifestPath = $null
 
 try {
 
@@ -302,14 +488,27 @@ if (-not $resolvedSource -or -not (Test-Path -LiteralPath $resolvedSource -PathT
     exit 1
 }
 $SourcePath = $resolvedSource.Path
-$sourceDirName = (Get-Item -LiteralPath $SourcePath).Name
+$sourceDirName = (Get-Item -LiteralPath $SourcePath -Force).Name
 $dateCode      = Get-Date -Format 'yyyyMMdd_HHmmss'
+
+# Reject overlaps before creating any output inside the source tree.
+$destinationFullPath = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($DestinationPath)
+if (Test-PathWithinDirectory -Path $destinationFullPath -Directory $SourcePath) {
+    throw 'DestinationPath must be outside the source directory to prevent backing up previous backups.'
+}
 
 if (-not (Test-Path -LiteralPath $DestinationPath)) {
     Write-Host "Destination directory does not exist; creating: $DestinationPath"
     New-Item -ItemType Directory -Path $DestinationPath -Force -WhatIf:$false | Out-Null
 }
 $DestinationPath = (Resolve-Path -Path $DestinationPath).Path
+
+$stagingParent = [System.IO.Path]::GetTempPath()
+if (Test-PathWithinDirectory -Path $stagingParent -Directory $SourcePath) {
+    # For example, a user-profile backup contains that user's system temp folder.
+    $stagingParent = $DestinationPath
+    Write-Host 'System temp is inside the source; staging in the backup destination instead.'
+}
 
 # ---------------------------------------------------------------------------
 # Concurrency protection
@@ -377,8 +576,6 @@ else {
 # ---------------------------------------------------------------------------
 # VSS shadow copy (requires elevation; falls back gracefully if unavailable)
 # ---------------------------------------------------------------------------
-$shadowObj      = $null
-$shadowIdForCleanup = $null
 $compressSource = $SourcePath
 
 $currentIdentity  = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -450,6 +647,7 @@ if ($isAdmin) {
     catch {
         Write-Warning "VSS shadow copy failed: $($_.Exception.Message)  Compressing live files."
         $shadowObj = $null
+        $compressSource = $SourcePath
     }
 } else {
     Write-Warning ('Not running as Administrator; VSS shadow copy skipped. ' +
@@ -457,9 +655,9 @@ if ($isAdmin) {
 }
 
 # ---------------------------------------------------------------------------
-# Build staging copy in system temp for more reliable reads from live trees
+# Build staging copy outside the source for more reliable reads from live trees
 # ---------------------------------------------------------------------------
-$stagingRoot = Join-Path ([System.IO.Path]::GetTempPath()) ($stagingPrefix + [guid]::NewGuid().ToString('N'))
+$stagingRoot = Join-Path $stagingParent ($stagingPrefix + [guid]::NewGuid().ToString('N'))
 $stagingSource = Join-Path $stagingRoot $sourceDirName
 
 Write-Host "Preparing staging directory: $stagingRoot"
@@ -491,18 +689,17 @@ if ($robocopyExitCode -ge 8) {
 }
 
 $compressSource = $stagingSource
-$stagingReady = $true
 Write-Host "Staging complete (Robocopy exit code $robocopyExitCode)."
 
 # ---------------------------------------------------------------------------
 # Build source inventory once and run free-space pre-check
 # ---------------------------------------------------------------------------
 Write-Host 'Indexing source files ...'
-$sourceFiles = @(Get-ChildItem -LiteralPath $compressSource -Recurse -File | Sort-Object -Property FullName)
-$sourceSize = ($sourceFiles | Measure-Object -Property Length -Sum).Sum
-if ($null -eq $sourceSize) { $sourceSize = 0 }
-$largestSourceFile = ($sourceFiles | Measure-Object -Property Length -Maximum).Maximum
-if ($null -eq $largestSourceFile) { $largestSourceFile = 0 }
+$sourceFiles = @(Get-ChildItem -LiteralPath $compressSource -Recurse -File -Force | Sort-Object -Property FullName)
+$sourceSize = 0L
+if ($sourceFiles.Count -gt 0) {
+    $sourceSize = ($sourceFiles | Measure-Object -Property Length -Sum).Sum
+}
 
 Write-Host 'Checking available disk space ...'
 $destDrive = Split-Path -Qualifier $DestinationPath
@@ -535,7 +732,6 @@ $WhatIfPreference = $false
 
 $zipFileName   = "${sourceDirName}_${dateCode}.zip"
 $zipFilePath   = Join-Path $DestinationPath $zipFileName
-# Compress-Archive on Windows PowerShell 5.1 requires a .zip extension.
 $tempZipPath   = Join-Path $DestinationPath ("${sourceDirName}_${dateCode}.tmp.zip")
 $manifestFileName = "${sourceDirName}_${dateCode}.manifest.sha256"
 $manifestFilePath = Join-Path $DestinationPath $manifestFileName
@@ -543,52 +739,16 @@ $tempManifestPath = $manifestFilePath + '.tmp'
 
 Write-Host "Backing up '$SourcePath' -> '$zipFilePath' ..."
 
-$backupJob = $null
-$oversizeThresholdBytes = [int64]2GB
-$useDotNetZip = ($largestSourceFile -ge $oversizeThresholdBytes)
-if ($useDotNetZip) {
-    Write-Host ("Large source file detected ({0:N0} bytes). " -f $largestSourceFile) +
-        'Using Zip64-capable .NET compression engine.'
-}
+# Run compression in a background job so we can show progress on the foreground thread.
+$backupJob = Start-Job -ScriptBlock {
+    param($src, $dest)
 
-try {
-    # Run compression in a background job so we can show progress on the foreground thread.
-    $backupJob = Start-Job -ScriptBlock {
-        param($src, $dest, $preferDotNet)
-
-        function Invoke-DotNetZip {
-            param(
-                [string]$InSource,
-                [string]$InDest
-            )
-
-            Add-Type -AssemblyName System.IO.Compression.FileSystem
-            [System.IO.Compression.ZipFile]::CreateFromDirectory(
-                $InSource,
-                $InDest,
-                [System.IO.Compression.CompressionLevel]::Optimal,
-                $true
-            )
-        }
-
-        if ($preferDotNet) {
-            Invoke-DotNetZip -InSource $src -InDest $dest
-            return
-        }
-
-        try {
-            Compress-Archive -Path $src -DestinationPath $dest -CompressionLevel Optimal
-        }
-        catch {
-            $message = $_.Exception.Message
-            if ($message -match 'Stream was too long') {
-                Invoke-DotNetZip -InSource $src -InDest $dest
-            }
-            else {
-                throw
-            }
-        }
-    } -ArgumentList $compressSource, $tempZipPath, $useDotNetZip
+    $ErrorActionPreference = 'Stop'
+    # .NET includes hidden files and empty directories and supports Zip64.
+    Add-Type -AssemblyName System.IO.Compression, System.IO.Compression.FileSystem
+    [System.IO.Compression.ZipFile]::CreateFromDirectory(
+        $src, $dest, [System.IO.Compression.CompressionLevel]::Optimal, $true)
+} -ArgumentList $compressSource, $tempZipPath
 
 $spinnerFrames = @('|', '/', '-', '\')
 $frame         = 0
@@ -625,50 +785,10 @@ if ($zipSize -eq 0) {
     throw 'Validation failed: zip file is empty.'
 }
 
-# 2. Zip must open without errors; 3. Compare entry sizes to source files
-Add-Type -AssemblyName System.IO.Compression.FileSystem
-
-$archive = [System.IO.Compression.ZipFile]::OpenRead($tempZipPath)
-try {
-    $entryTable = @{}
-    foreach ($entry in $archive.Entries) {
-        if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) { continue }
-        $entryTable[$entry.FullName.Replace('\', '/')] = $entry.Length
-    }
-
-    $mismatches   = [System.Collections.Generic.List[string]]::new()
-    $missingFiles = [System.Collections.Generic.List[string]]::new()
-
-    foreach ($file in $sourceFiles) {
-        $relative = $file.FullName.Substring($compressSource.Length).TrimStart([char]92, [char]'/')
-        $entryKey = "$sourceDirName/$($relative.Replace('\', '/'))"
-
-        if (-not $entryTable.ContainsKey($entryKey)) {
-            $missingFiles.Add($relative)
-        }
-        elseif ($entryTable[$entryKey] -ne $file.Length) {
-            $mismatches.Add("$relative  (source: $($file.Length) bytes, zip: $($entryTable[$entryKey]) bytes)")
-        }
-    }
-
-    $valErrors = $missingFiles.Count + $mismatches.Count
-    if ($valErrors -gt 0) {
-        if ($missingFiles.Count -gt 0) {
-            Write-Warning "Validation: $($missingFiles.Count) file(s) missing from zip:"
-            $missingFiles | ForEach-Object { Write-Warning "  Missing : $_" }
-        }
-        if ($mismatches.Count -gt 0) {
-            Write-Warning "Validation: $($mismatches.Count) file(s) with size mismatch:"
-            $mismatches | ForEach-Object { Write-Warning "  Mismatch: $_" }
-        }
-        throw "Validation failed: $valErrors issue(s) found. The zip may be incomplete."
-    }
-
-    $entryCount = $entryTable.Count
-}
-finally {
-    $archive.Dispose()
-}
+# Fully read and hash every archived file before promoting the backup.
+$validation = Test-BackupArchive -ArchivePath $tempZipPath -SourceDirectory $compressSource `
+    -SourceDirectoryName $sourceDirName -SourceFiles $sourceFiles
+$entryCount = $validation.EntryCount
 
 # Atomic rename: only promote to final name after successful validation
 Move-Item -LiteralPath $tempZipPath -Destination $zipFilePath -WhatIf:$false
@@ -687,78 +807,14 @@ $manifestLines.Add("SourcePath=$SourcePath")
 $manifestLines.Add('')
 $manifestLines.Add('SHA256  SizeBytes  RelativePath')
 
-$sourceFiles |
+$validation.Files |
     ForEach-Object {
-        $relativePath = $_.FullName.Substring($compressSource.Length).TrimStart([char]92, [char]'/')
-        $fileHash = (Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash
-        $manifestLines.Add("$fileHash  $($_.Length)  $($relativePath.Replace('\', '/'))")
+        $manifestLines.Add("$($_.SHA256)  $($_.SizeBytes)  $($_.RelativePath)")
     }
 
 Set-Content -LiteralPath $tempManifestPath -Value $manifestLines -Encoding utf8 -WhatIf:$false
 Move-Item -LiteralPath $tempManifestPath -Destination $manifestFilePath -Force -WhatIf:$false
 Write-Host "Manifest complete: $manifestFileName"
-}
-catch {
-    # Remove the partial temp file so it cannot be mistaken for a valid backup
-    if (Test-Path -LiteralPath $tempZipPath) {
-        Write-Warning "Removing incomplete temporary file: $(Split-Path $tempZipPath -Leaf)"
-        Remove-Item -LiteralPath $tempZipPath -Force -ErrorAction SilentlyContinue -WhatIf:$false
-    }
-    if (Test-Path -LiteralPath $tempManifestPath) {
-        Write-Warning "Removing incomplete temporary manifest: $(Split-Path $tempManifestPath -Leaf)"
-        Remove-Item -LiteralPath $tempManifestPath -Force -ErrorAction SilentlyContinue -WhatIf:$false
-    }
-    throw
-}
-finally {
-    if ($null -ne $backupJob) {
-        try {
-            Stop-Job -Job $backupJob -ErrorAction SilentlyContinue -WhatIf:$false
-            Remove-Job -Job $backupJob -Force -ErrorAction SilentlyContinue -WhatIf:$false
-        }
-        catch {
-            Write-Warning "Failed to clean up background backup job: $_"
-        }
-    }
-
-    # Always release the VSS shadow copy regardless of success or failure
-    if ($null -ne $shadowObj) {
-        try {
-            Write-Host 'Removing VSS shadow copy ...'
-            $shadowObj | Remove-CimInstance
-            $shadowIdForCleanup = $null
-        }
-        catch {
-            Write-Warning "Failed to remove VSS shadow copy '$($shadowObj.ID)': $_"
-        }
-    }
-    elseif ($shadowIdForCleanup) {
-        try {
-            $orphanShadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$shadowIdForCleanup'" -ErrorAction SilentlyContinue
-            if ($null -ne $orphanShadow) {
-                Write-Host 'Removing VSS shadow copy (fallback by ID) ...'
-                $orphanShadow | Remove-CimInstance
-            }
-        }
-        catch {
-            Write-Warning "Failed to remove VSS shadow copy '$shadowIdForCleanup': $_"
-        }
-    }
-
-    if ($stagingRoot -and (Test-Path -LiteralPath $stagingRoot)) {
-        try {
-            Write-Host "Removing staging directory: $stagingRoot"
-            Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction Stop -WhatIf:$false
-        }
-        catch {
-            Write-Warning "Failed to remove staging directory '$stagingRoot': $($_.Exception.Message)"
-        }
-        finally {
-            $stagingReady = $false
-        }
-    }
-}
-
 $WhatIfPreference = $originalWhatIfPreference
 
 # ---------------------------------------------------------------------------
@@ -932,10 +988,62 @@ catch {
     $runSucceeded = $false
     $notificationTitle = 'Backup Failed'
     $notificationMessage = $_.Exception.Message
-    Write-Error "Backup failed: $($_.Exception.Message)"
+    Write-Error "Backup failed: $($_.Exception.Message)" -ErrorAction Continue
     exit 1
 }
 finally {
+    # These resources can be allocated well before compression starts.
+    # Stop the writer before deleting its temporary archive or staging inputs.
+    if ($null -ne $backupJob) {
+        try {
+            Stop-Job -Job $backupJob -ErrorAction SilentlyContinue -WhatIf:$false
+            Remove-Job -Job $backupJob -Force -ErrorAction SilentlyContinue -WhatIf:$false
+        }
+        catch {
+            Write-Warning "Failed to clean up background backup job: $_"
+        }
+    }
+
+    foreach ($temporaryFile in @($tempZipPath, $tempManifestPath)) {
+        if ($temporaryFile -and (Test-Path -LiteralPath $temporaryFile)) {
+            Remove-Item -LiteralPath $temporaryFile -Force -ErrorAction SilentlyContinue -WhatIf:$false
+        }
+    }
+
+    if ($null -ne $shadowObj) {
+        try {
+            Write-Host 'Removing VSS shadow copy ...'
+            $shadowObj | Remove-CimInstance -WhatIf:$false -Confirm:$false
+            $shadowIdForCleanup = $null
+        }
+        catch {
+            Write-Warning "Failed to remove VSS shadow copy '$($shadowObj.ID)': $_"
+        }
+    }
+    if ($shadowIdForCleanup) {
+        try {
+            $orphanShadow = Get-CimInstance -ClassName Win32_ShadowCopy -Filter "ID='$shadowIdForCleanup'" -ErrorAction SilentlyContinue
+            if ($null -ne $orphanShadow) {
+                Write-Host 'Removing VSS shadow copy (fallback by ID) ...'
+                $orphanShadow | Remove-CimInstance -WhatIf:$false -Confirm:$false
+            }
+        }
+        catch {
+            Write-Warning "Failed to remove VSS shadow copy '$shadowIdForCleanup': $_"
+        }
+    }
+
+    if ($stagingRoot -and (Test-Path -LiteralPath $stagingRoot)) {
+        try {
+            Write-Host "Removing staging directory: $stagingRoot"
+            Remove-Item -LiteralPath $stagingRoot -Recurse -Force -ErrorAction Stop -WhatIf:$false
+        }
+        catch {
+            Write-Warning "Failed to remove staging directory '$stagingRoot': $($_.Exception.Message)"
+        }
+    }
+    $WhatIfPreference = $originalWhatIfPreference
+
     if ($null -ne $runMutex) {
         try {
             if ($runLockAcquired) {

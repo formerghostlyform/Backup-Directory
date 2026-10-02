@@ -43,6 +43,7 @@ Unregister-ScheduledTask -TaskName "Backup MyApp Directory" -Confirm:$false
 ## What It Does
 
 - Creates a ZIP backup named like `<SourceDirName>_yyyyMMdd_HHmmss.zip`
+- Includes hidden files, hidden folders, and empty directories
 - Stores backups in the destination directory
 - Writes logs to a configurable log directory
 - Optionally sends a Windows notification on completion
@@ -62,10 +63,12 @@ Only ZIP files that match the expected naming format are managed. Other files in
 ## Reliability Features
 
 - Atomic write: creates backup as a temporary file and renames only after validation
-- Checksum manifest: writes SHA-256 checksum manifest after successful validation
+- Content validation: reads every archived file and compares its SHA-256 hash and size with the staged original; rejects missing, duplicate, and unexpected files
+- Checksum manifest: records the validated file hashes and the completed archive's SHA-256 hash
 - Concurrency lock: prevents overlapping runs for the same source/destination pair
 - VSS snapshot: uses Volume Shadow Copy when running as Administrator (skips gracefully otherwise)
 - Free-space check: verifies destination has enough space before compression
+- Resource cleanup: releases staging directories, temporary output, background jobs, and VSS snapshots even when a run fails before compression
 
 ## Requirements
 
@@ -136,5 +139,18 @@ The script supports PowerShell `-WhatIf` behavior for cleanup/delete operations:
 
 ## Notes
 
+- The backup destination must be outside the source directory. Destinations equal to or inside the source are rejected before output is created, including overlaps through directory junctions and Windows short-path aliases.
+- Staging normally uses system temp. If that folder is inside the source, staging uses the backup destination instead, which needs room for both the staged copy and the archive.
 - Running as Administrator improves consistency for open/in-use files due to VSS snapshot support.
 - If another identical backup job is already running (same script, source, destination), a second run will be blocked.
+
+## Regression Tests
+
+The dependency-free test suite creates and removes isolated temporary fixtures. VSS calls are mocked; no real snapshots are created or deleted. It covers hidden files, empty directories, overlapping paths, archive-content validation, and cleanup after injected failures.
+
+Run with either supported PowerShell version:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-Backup-Directory.ps1
+pwsh -NoProfile -File .\tests\Test-Backup-Directory.ps1
+```
